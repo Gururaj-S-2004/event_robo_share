@@ -1,4 +1,8 @@
-pyserial>=3.5
+# Pinned to the 12.x line: the WebSocket server API this backend uses
+# (websockets.serve, connection.recv()/.send(), ConnectionClosed) is stable
+# there; 13+ introduced a parallel asyncio implementation with some API
+# churn that isn't worth chasing for this project's needs.
+websockets>=12.0,<13.0
 python-dotenv>=1.0.1
 numpy>=1.26,<2.0
 requests>=2.31

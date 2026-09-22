@@ -1,15 +1,23 @@
-"""Text-to-speech via Piper (offline, local .onnx voice model).
+"""Text-to-speech via Piper (offline, local .onnx voice model), played
+immediately on the laptop's own speakers - the ESP32 never receives
+synthesized audio (see ws_link.py / EventRobot.ino's WIRE PROTOCOL note).
 
 Piper voices typically synthesize at 22050 Hz; we resample to
-config.AUDIO_SAMPLE_RATE (16000, matching EventRobot.ino's I2S speaker
-config) with simple linear interpolation - good enough for spoken-word
-audio and avoids pulling in scipy/audioop just for this.
+config.AUDIO_SAMPLE_RATE (16000) with simple linear interpolation - good
+enough for spoken-word audio and avoids pulling in scipy/audioop just for
+this.
+
+Playback uses sounddevice (PortAudio) rather than simpleaudio: mic.py
+already depends on it for recording, so reusing it here avoids a second
+audio backend, and its prebuilt-wheel coverage across Windows/macOS/Linux
+and Python versions is more reliable than simpleaudio's.
 """
 from __future__ import annotations
 
 import logging
 
 import numpy as np
+import sounddevice as sd
 
 import config
 
@@ -40,8 +48,8 @@ def _resample_linear(samples: np.ndarray, orig_sr: int, target_sr: int) -> np.nd
 
 
 def synthesize(text: str) -> bytes:
-    """Returns raw PCM16LE mono bytes at config.AUDIO_SAMPLE_RATE, ready to
-    hand straight to SerialLink.send_audio_frame()."""
+    """Returns raw PCM16LE mono bytes at config.AUDIO_SAMPLE_RATE. Pure
+    synthesis, no playback - see play() / synthesize_and_play()."""
     if not text.strip():
         return b""
 
@@ -67,4 +75,22 @@ def synthesize(text: str) -> bytes:
         frame_rate,
         config.AUDIO_SAMPLE_RATE,
     )
+    return pcm_bytes
+
+
+def play(pcm_bytes: bytes) -> None:
+    """Plays raw PCM16LE mono bytes at config.AUDIO_SAMPLE_RATE on the
+    laptop's own speakers, blocking until playback finishes."""
+    if not pcm_bytes:
+        return
+    samples = np.frombuffer(pcm_bytes, dtype="<i2")
+    sd.play(samples, samplerate=config.AUDIO_SAMPLE_RATE, blocking=True)
+
+
+def synthesize_and_play(text: str) -> bytes:
+    """Synthesizes `text` and immediately plays it on the laptop's own
+    speakers (blocking until playback finishes). Returns the PCM bytes that
+    were played (empty bytes if synthesis produced nothing)."""
+    pcm_bytes = synthesize(text)
+    play(pcm_bytes)
     return pcm_bytes

@@ -30,10 +30,11 @@ def _env_float(name: str, default: float) -> float:
     return float(os.getenv(name, str(default)))
 
 
-# -- Serial link --------------------------------------------------------
-SERIAL_PORT = _env("SERIAL_PORT", "COM3")
-SERIAL_BAUD = _env_int("SERIAL_BAUD", 921600)
-SERIAL_COMMAND_TIMEOUT_S = _env_float("SERIAL_COMMAND_TIMEOUT_S", 20.0)
+# -- WebSocket link (the laptop is the server; the ESP32 connects as a
+# client over WiFi - see EventRobot.ino's WIFI_SSID/WIFI_PASSWORD/WS_HOST) --
+LAPTOP_WS_HOST = _env("LAPTOP_WS_HOST", "0.0.0.0")
+LAPTOP_WS_PORT = _env_int("LAPTOP_WS_PORT", 8765)
+WS_COMMAND_TIMEOUT_S = _env_float("WS_COMMAND_TIMEOUT_S", 20.0)
 
 # -- Speech-to-text (faster-whisper, offline) ----------------------------
 WHISPER_MODEL_SIZE = _env("WHISPER_MODEL_SIZE", "small.en")

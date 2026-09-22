@@ -5,44 +5,88 @@
 #include <driver/i2s.h>
 #include <math.h>
 #include <WiFi.h>
+#include <WebSocketsClient.h>
 
 // ============================================================================
-// WIRE PROTOCOL (USB Serial, 921600 baud, matches robot_backend/serial_link.py)
+// WIFI / WEBSOCKET SETTINGS - edit these for your event's network.
+// ============================================================================
+#define WIFI_SSID     "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+
+// The laptop's WebSocket server - must be the laptop's actual LAN IP (check
+// `ipconfig` on Windows), NOT 0.0.0.0, since the ESP32 dials out to it.
+// Port must match robot_backend/.env's LAPTOP_WS_PORT.
+#define WS_HOST "192.168.1.100"
+#define WS_PORT 8765
+#define WS_PATH "/"
+
+// ============================================================================
+// WIRE PROTOCOL (WiFi + WebSocket, matches robot_backend/ws_link.py)
 // ----------------------------------------------------------------------------
-// ESP32 -> laptop (ASCII lines, '\n'-terminated unless noted):
+// Transport: the ESP32-S3 connects to WiFi in station mode (WIFI_SSID /
+// WIFI_PASSWORD above) and is the WebSocket *client* - it dials out to the
+// laptop's WebSocket *server* at ws://WS_HOST:WS_PORT/ (robot_backend's
+// LAPTOP_WS_HOST/LAPTOP_WS_PORT from .env - LAPTOP_WS_HOST must be the
+// laptop's real LAN IP for the ESP32 to reach it, not 0.0.0.0). USB is
+// power + local debug Serial Monitor output ONLY - no protocol data
+// crosses the USB cable anymore.
+//
+// Every ASCII "line" below is sent as one WebSocket TEXT frame (no '\n'
+// needed - WebSocket messages are already framed, unlike the old UART
+// byte stream). A raw PCM16LE binary payload, if ever used, is sent as one
+// WebSocket BINARY frame.
+//
+// ESP32 -> laptop (text frames):
 //   STATUS:<text>              informational, laptop just logs it
-//     STATUS:LISTEN_READY      signals the laptop to start recording from its
-//                               own microphone (no audio captured on ESP32)
-//     STATUS:GREETING_DONE     greeting animation + tone complete
-//     STATUS:IDLE              interaction finished, back to idle
-//   TRIGGER:BUTTON              button pressed while idle
-//   TRIGGER:PROXIMITY           someone detected in range while idle
-//   ERROR:<text>                something went wrong on the ESP32 side
-//   AUDIO_START:<len>:<crc32>   begins a raw PCM16LE mono 16kHz payload of
-//                                exactly <len> bytes, immediately followed by
-//                                those <len> raw bytes (NOT text, no
-//                                delimiters inside), then a bare line:
-//   AUDIO_END                   payload complete; CRC32 (IEEE 802.3 poly,
-//                                same as Python's zlib.crc32) covers exactly
-//                                those <len> bytes
+//     STATUS:READY              (re)connected and idle, ready for visitors
+//     STATUS:LISTEN_READY       signals the laptop to start recording from
+//                                 its own microphone (no audio captured on
+//                                 the ESP32)
+//     STATUS:GREETING_DONE      greeting animation + chirp complete
+//     STATUS:IDLE                interaction finished, back to idle
+//   TRIGGER:BUTTON               button pressed while idle
+//   TRIGGER:PROXIMITY            someone detected in range while idle
+//   ERROR:<text>                 something went wrong on the ESP32 side
 //
-// laptop -> ESP32 (ASCII lines):
-//   COMMAND:GREET                play wave + greeting tone (local, no audio)
-//   COMMAND:LISTEN               ESP32 signals LISTEN_READY; laptop records
-//                                 from its own mic, sends STATUS:RECORDING_DONE
-//                                 when finished - no audio is streamed from
-//                                 ESP32 in this direction
-//   COMMAND:PROCESSING           purely a status hint ("Thinking...")
-//   COMMAND:SPEAK                followed immediately by one
-//                                 AUDIO_START:<len>:<crc32> / bytes / AUDIO_END
-//                                 frame that the ESP32 should play out loud
-//   COMMAND:IDLE                 return to idle / reset
-//   STATUS:RECORDING_DONE        laptop finished capturing from its own mic
+// laptop -> ESP32 (text frames):
+//   COMMAND:GREET                 play wave + greeting chirp (played
+//                                  locally over I2S -> MAX98357A if fitted;
+//                                  this never involves the laptop)
+//   COMMAND:LISTEN                 ESP32 signals LISTEN_READY; laptop
+//                                   records from its own mic, then sends
+//                                   STATUS:RECORDING_DONE when finished -
+//                                   no audio is streamed from the ESP32
+//   COMMAND:PROCESSING             status hint only ("Thinking..." on TFT)
+//   COMMAND:DISPLAY_A:<text>       status hint only - shows the answer
+//                                   text on the TFT
+//   COMMAND:SPEAKING               status hint only ("Speaking..." on the
+//                                   TFT) while the laptop plays the answer
+//                                   out loud on its OWN speakers - no
+//                                   audio bytes travel to the board
+//   COMMAND:IDLE                   return to idle / reset
+//   STATUS:RECORDING_DONE           (a bare line, not COMMAND:-prefixed)
+//                                   laptop finished capturing from its
+//                                   own mic
 //
-// Both sides must agree on this exactly - see robot_backend/serial_link.py.
+// Reconnection: on WiFi or WebSocket drop, the ESP32 retries with
+// exponential backoff (1s, doubling up to a 30s cap) and prints
+// STATUS:RECONNECTING / STATUS:READY to the local USB debug Serial
+// Monitor (these can't reach the laptop over the WebSocket while it's
+// down). Once reconnected, the ESP32 also sends STATUS:READY over the
+// WebSocket, and the laptop resends COMMAND:IDLE to resync state - see
+// robot_backend/ws_link.py and main.py.
+//
+// AUDIO_START:<len>:<crc32> / <len> raw PCM16LE mono 16kHz bytes (as one
+// BINARY frame) / AUDIO_END is still defined as a transport primitive in
+// robot_backend/ws_link.py (read_audio_frame()/send_audio_frame()) for
+// potential future reuse, but nothing calls it today - mic capture and
+// TTS playback both happen entirely on the laptop - and this firmware no
+// longer contains any code to receive or play such a frame.
+//
+// Both sides must agree on this exactly - see robot_backend/ws_link.py.
 // ============================================================================
 
-#define SERIAL_BAUD 921600
+#define SERIAL_DEBUG_BAUD 115200
 
 // ============================================================================
 // PIN DEFINITIONS (ESP32-S3 DevKit - avoids strapping pins 0/3/45/46 and
@@ -64,10 +108,12 @@
 #define PIN_TFT_SCLK 12    // SCL / SCK / CLK
 // Note: Connect TFT BLK/LED to 3.3V, VCC to 3.3V (or 5V), GND to GND
 
-// Microphone: audio is now captured by the laptop's own mic.
+// Microphone: audio is captured by the laptop's own mic.
 // The INMP441 I2S mic has been removed. No mic pins are needed on the ESP32.
 
-// MAX98357A amplifier (I2S output, uses I2S peripheral #1)
+// MAX98357A amplifier (I2S output, uses I2S peripheral #1) - OPTIONAL,
+// only needed if you want the greeting chirp through a real speaker. The
+// answer audio is played on the laptop's own speakers, never here.
 #define PIN_SPK_BCLK 1     // BCLK
 #define PIN_SPK_LRC  2     // LRC / WS
 #define PIN_SPK_DOUT 38    // DIN on the MAX98357A. Tie its SD pin high (always on) or to a spare GPIO.
@@ -80,7 +126,6 @@
 // Pass the SPI class explicitly to ensure it uses the custom pins on ESP32-S3
 Adafruit_ST7735 tft = Adafruit_ST7735(&SPI, PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
 bool tftReady = false;
-bool tftBusy = false;  // true while audio is playing - blocks TFT SPI to prevent bus contention
 
 // ============================================================================
 // SERVO CONFIG
@@ -96,33 +141,52 @@ Servo handServo;
 #define ULTRASONIC_TIMEOUT_US 30000UL  // ~5 m max range
 
 // ============================================================================
-// AUDIO CONFIG
+// AUDIO CONFIG (greeting chirp only - see MAX98357A note above)
 // ============================================================================
 #define SAMPLE_RATE          16000
-#define I2S_SPK_PORT         I2S_NUM_0    // only one I2S port needed now (speaker)
+#define I2S_SPK_PORT         I2S_NUM_0    // only one I2S port needed (speaker/chirp)
 #define CHUNK_SAMPLES         512          // mono samples per I2S write chunk (32ms at 16kHz)
 // DMA depth: 4 buffers × 512 stereo samples = 128ms of pipeline depth.
-// Keeps drain time short (128ms + 50ms margin = ~180ms) so the TFT SPI
-// transaction in returnToIdle() never overlaps with active I2S DMA.
 #define I2S_DMA_BUF_COUNT    4
 #define I2S_DMA_BUF_LEN      CHUNK_SAMPLES  // stereo samples per DMA buffer
-#define SERIAL_CMD_TIMEOUT_MS  20000       // how long to wait for a laptop command/audio
+#define WS_CMD_TIMEOUT_MS    20000         // how long to wait for a laptop command
 
-// CRC32 (IEEE 802.3, same polynomial/algorithm as Python's zlib.crc32).
-// Incremental API so multi-chunk streams can be verified without buffering
-// the whole payload: crc32Init() -> crc32Update() per chunk -> crc32Final().
-static const uint32_t CRC32_POLY = 0xEDB88320UL;
-uint32_t crc32Init() { return 0xFFFFFFFFUL; }
-uint32_t crc32Update(uint32_t crc, const uint8_t *data, size_t len) {
-  for (size_t i = 0; i < len; i++) {
-    crc ^= data[i];
-    for (int b = 0; b < 8; b++) {
-      crc = (crc >> 1) ^ (CRC32_POLY & (~(crc & 1) + 1));
-    }
+// ============================================================================
+// WEBSOCKET CLIENT + RECONNECT STATE
+// ============================================================================
+WebSocketsClient webSocket;
+bool wsConnected = false;
+
+#define WS_BACKOFF_MIN_MS 1000UL
+#define WS_BACKOFF_MAX_MS 30000UL
+uint32_t wsBackoffMs = WS_BACKOFF_MIN_MS;
+unsigned long lastConnectAttempt = 0;
+
+// Small FIFO of incoming TEXT-frame lines, filled by onWsEvent() and drained
+// by readLineBlocking() - keeps the rest of the protocol code (waitForCommand,
+// streamMicToBackend, etc.) blocking-style and unchanged from the old
+// Serial-based version.
+#define WS_LINE_QUEUE_LEN 8
+String wsLineQueue[WS_LINE_QUEUE_LEN];
+uint8_t wsQueueHead = 0, wsQueueTail = 0;
+
+void wsQueuePush(const String &line) {
+  uint8_t next = (wsQueueTail + 1) % WS_LINE_QUEUE_LEN;
+  if (next == wsQueueHead) {
+    // Queue full (shouldn't happen - one command line at a time in this
+    // protocol): drop the oldest to make room rather than lose the newest.
+    wsQueueHead = (wsQueueHead + 1) % WS_LINE_QUEUE_LEN;
   }
-  return crc;
+  wsLineQueue[wsQueueTail] = line;
+  wsQueueTail = next;
 }
-uint32_t crc32Final(uint32_t crc) { return crc ^ 0xFFFFFFFFUL; }
+
+bool wsQueuePop(String &out) {
+  if (wsQueueHead == wsQueueTail) return false;
+  out = wsLineQueue[wsQueueHead];
+  wsQueueHead = (wsQueueHead + 1) % WS_LINE_QUEUE_LEN;
+  return true;
+}
 
 // ============================================================================
 // STATE MACHINE
@@ -131,9 +195,7 @@ enum SystemState {
   STATE_IDLE,
   STATE_GREETING,
   STATE_LISTENING,
-  STATE_WAITING_RESPONSE,
-  STATE_SPEAKING,
-  STATE_ERROR
+  STATE_WAITING_RESPONSE
 };
 SystemState currentState = STATE_IDLE;
 
@@ -153,13 +215,7 @@ void showIdleDistance(long dist);
 // SETUP
 // ============================================================================
 void setup() {
-  // 32 KB RX buffer: at 921600 baud (~92 KB/s) this gives ~350ms of headroom.
-  // The laptop sends audio in paced 1KB chunks but Windows timer granularity
-  // can cause bursts; a large buffer absorbs them without dropping bytes.
-  Serial.setRxBufferSize(32768);
-  Serial.begin(SERIAL_BAUD);
-  unsigned long bootStart = millis();
-  while (!Serial && millis() - bootStart < 3000) { delay(10); }
+  Serial.begin(SERIAL_DEBUG_BAUD);  // USB is power + local debug log only now
   delay(300);
 
   setupTFT();
@@ -167,27 +223,34 @@ void setup() {
   setupTriggers();
   setupSpeakerI2S();
 
-  showStatus("Ready", "Press button\nor stand\nclose to\nstart");
-  sendStatus("READY");
+  showStatus("Starting", "Connecting\nto WiFi...");
 
-  // Turn on Wi-Fi to draw extra current and prevent power bank auto-shutdown
   WiFi.mode(WIFI_STA);
+  webSocket.onEvent(onWsEvent);
+  // We drive our own exponential-backoff reconnect from maintainWiFiAndWs()
+  // instead of the library's fixed-interval one, so no setReconnectInterval()
+  // call here. The very first WiFi/WebSocket connection also happens lazily
+  // from loop() via maintainWiFiAndWs() - nothing to do here but wait.
 }
 
 // ============================================================================
 // MAIN LOOP
-// Idle: poll triggers AND watch for an out-of-band COMMAND: line from the
-// laptop (e.g. it may want to push COMMAND:IDLE on reconnect). Once
-// triggered, run the whole interaction start-to-finish (blocking) then
-// return to idle. Only one visitor is served at a time.
+// Idle: pump the WebSocket client, maintain the WiFi/WS connection, and
+// (once connected) poll triggers AND watch for an out-of-band COMMAND: line
+// from the laptop. Once triggered, run the whole interaction start-to-finish
+// (blocking) then return to idle. Only one visitor is served at a time.
 // ============================================================================
 void loop() {
+  webSocket.loop();
+  maintainWiFiAndWs();
+
+  if (!wsConnected) return;  // nothing to do until the laptop link is up
+
   if (currentState == STATE_IDLE) {
     // Drain and ignore any stray laptop command while idle (keeps protocol
     // in sync if the backend restarts mid-session and resends COMMAND:IDLE).
-    if (Serial.available()) {
-      String stray = Serial.readStringUntil('\n');
-      stray.trim();
+    String stray;
+    if (wsQueuePop(stray)) {
       // nothing to act on here; idle already implies COMMAND:IDLE state
     }
 
@@ -221,17 +284,86 @@ void loop() {
 }
 
 // ============================================================================
+// WIFI / WEBSOCKET CONNECTION MANAGEMENT
+// ============================================================================
+void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      if (wsConnected) {
+        Serial.println("STATUS:RECONNECTING");
+      }
+      wsConnected = false;
+      break;
+
+    case WStype_CONNECTED:
+      wsConnected = true;
+      wsBackoffMs = WS_BACKOFF_MIN_MS;  // reset backoff after a successful connect
+      Serial.println("STATUS:READY");
+      sendStatus("READY");
+      showStatus("Ready", "Press button\nor stand\nclose to\nstart");
+      break;
+
+    case WStype_TEXT:
+      // WebSocketsClient null-terminates TEXT frame payloads, so this is
+      // safe without using `length` explicitly (Arduino's String has no
+      // (buf, length) constructor).
+      wsQueuePush(String((char *)payload));
+      break;
+
+    case WStype_BIN:
+      // Binary frames are a documented transport primitive (see WIRE
+      // PROTOCOL) but nothing sends them today. Ignore defensively.
+      break;
+
+    default:
+      break;
+  }
+}
+
+// Called every loop() iteration. Owns the exponential-backoff reconnect for
+// both WiFi and the WebSocket client, and logs STATUS:RECONNECTING /
+// STATUS:READY locally (see the WIRE PROTOCOL note on why these can't
+// always reach the laptop).
+void maintainWiFiAndWs() {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wsConnected) {
+      wsConnected = false;
+      Serial.println("STATUS:RECONNECTING");
+      showStatus("Reconnecting", "WiFi lost...");
+    }
+    if (millis() - lastConnectAttempt < wsBackoffMs) return;
+    lastConnectAttempt = millis();
+    Serial.printf("Connecting to WiFi SSID '%s' (next retry in %lums if this fails)...\n",
+                  WIFI_SSID, (unsigned long)wsBackoffMs);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    wsBackoffMs = min(wsBackoffMs * 2, WS_BACKOFF_MAX_MS);
+    return;
+  }
+
+  if (!webSocket.isConnected()) {
+    if (millis() - lastConnectAttempt < wsBackoffMs) return;
+    lastConnectAttempt = millis();
+    Serial.printf("Connecting WebSocket to %s:%d (next retry in %lums if this fails)...\n",
+                  WS_HOST, WS_PORT, (unsigned long)wsBackoffMs);
+    showStatus("Reconnecting", "to laptop...");
+    webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
+    wsBackoffMs = min(wsBackoffMs * 2, WS_BACKOFF_MAX_MS);
+  }
+}
+
+// ============================================================================
 // FULL INTERACTION SEQUENCE
 // ============================================================================
 void runInteraction(const char *triggerSource) {
-  // Turn off Wi-Fi during interaction to prevent audio interference/glitches
-  WiFi.mode(WIFI_OFF);
-
+  // WiFi/WebSocket must stay up throughout - it's the only link to the
+  // laptop now (previously it was toggled off here purely to save power,
+  // since USB serial carried the protocol; that trick no longer applies).
   Serial.print("TRIGGER:");
   Serial.println(triggerSource);
+  wsSendLine(String("TRIGGER:") + triggerSource);
 
   // --- 1. Wait for COMMAND:GREET from the backend ---
-  String cmd = waitForCommand(SERIAL_CMD_TIMEOUT_MS);
+  String cmd = waitForCommand(WS_CMD_TIMEOUT_MS);
   if (cmd != "GREET") {
     sendError("Expected GREET, got: " + cmd);
     returnToIdle();
@@ -244,8 +376,8 @@ void runInteraction(const char *triggerSource) {
   drainAudioPipeline(); // flush DMA before any subsequent TFT SPI access
   sendStatus("GREETING_DONE");
 
-  // --- 2. Wait for COMMAND:LISTEN, then capture + stream mic audio ---
-  cmd = waitForCommand(SERIAL_CMD_TIMEOUT_MS);
+  // --- 2. Wait for COMMAND:LISTEN, then let the laptop record+confirm ---
+  cmd = waitForCommand(WS_CMD_TIMEOUT_MS);
   if (cmd != "LISTEN") {
     sendError("Expected LISTEN, got: " + cmd);
     returnToIdle();
@@ -255,61 +387,49 @@ void runInteraction(const char *triggerSource) {
   showStatus("Listening...", "Speak your\nquestion\nnow");
   streamMicToBackend();
 
-  // --- 3. Optional COMMAND:PROCESSING status hint, then wait for reply ---
+  // --- 3. Optional COMMAND:PROCESSING / DISPLAY_A / SPEAKING status hints,
+  //        then wait for the final IDLE ---
   currentState = STATE_WAITING_RESPONSE;
   showStatus("Thinking...", "Please wait");
 
-  // Save the displayed text so we can re-show it on the TFT after audio
-  // finishes. Without this, returnToIdle() immediately overwrites the
-  // answer with "Ready" the moment playback ends, making the TFT appear
-  // de-synced from the Python terminal which still shows the answer.
+  // Save the displayed text so we can re-show it on the TFT after the
+  // laptop finishes playing the answer on its own speakers. Without this,
+  // returnToIdle() immediately overwrites the answer with "Ready" the
+  // moment IDLE arrives, making the TFT appear de-synced from the Python
+  // terminal which still shows the answer.
   String lastAnswer = "";
 
-  cmd = waitForCommand(SERIAL_CMD_TIMEOUT_MS);
+  cmd = waitForCommand(WS_CMD_TIMEOUT_MS);
   if (cmd == "PROCESSING") {
-    cmd = waitForCommand(SERIAL_CMD_TIMEOUT_MS);
+    cmd = waitForCommand(WS_CMD_TIMEOUT_MS);
   }
 
   if (cmd.startsWith("DISPLAY_Q:")) {
     // Question is displayed in the laptop terminal only, not on the TFT
-    cmd = waitForCommand(SERIAL_CMD_TIMEOUT_MS);
+    cmd = waitForCommand(WS_CMD_TIMEOUT_MS);
   }
 
   if (cmd.startsWith("DISPLAY_A:")) {
     lastAnswer = cmd.substring(10);
     showStatus("Answer:", lastAnswer.c_str(), ST7735_CYAN);
-    cmd = waitForCommand(SERIAL_CMD_TIMEOUT_MS);
+    cmd = waitForCommand(WS_CMD_TIMEOUT_MS);
   }
 
-  if (cmd == "SPEAK") {
-    currentState = STATE_SPEAKING;
-    // tftBusy blocks showStatus()/showIdleDistance() so SPI never runs
-    // while I2S DMA is active (both use GDMA on ESP32-S3; simultaneous
-    // transfers corrupt each other, causing the crackle+glitch symptom).
-    tftBusy = true;
-    if (!receiveAndPlayAudio()) {
-      sendError("Failed to receive/play TTS audio");
-    }
-    drainAudioPipeline(); // wait for DMA to empty *before* clearing the flag
-    tftBusy = false;      // only now is it safe to write to TFT
+  if (cmd == "SPEAKING") {
+    // Status hint only (same idea as PROCESSING) - the laptop is playing
+    // the answer on its own speakers right now; no audio bytes travel to
+    // the board. We just wait for the IDLE that follows once it's done.
+    showStatus("Speaking...", "Answer is\nplaying on\nthe laptop", ST7735_CYAN);
+    cmd = waitForCommand(WS_CMD_TIMEOUT_MS);
+  }
 
-    // Re-show the answer after audio finishes so the TFT stays in sync
-    // with the terminal. Without this the display jumps straight to
-    // "Ready" the moment the last DMA buffer drains, while the Python
-    // backend log still shows the answer text.
+  if (cmd == "IDLE") {
     if (lastAnswer.length() > 0) {
       showStatus("Answer:", lastAnswer.c_str(), ST7735_CYAN);
       delay(4000); // keep the answer visible for 4 seconds
     }
-  } else if (cmd == "IDLE") {
-    // backend gave up / had nothing to say - but still show the answer
-    // if we got one (e.g. TTS failed), so the TFT is never blank.
-    if (lastAnswer.length() > 0) {
-      showStatus("Answer:", lastAnswer.c_str(), ST7735_CYAN);
-      delay(4000);
-    }
   } else {
-    sendError("Expected SPEAK or IDLE, got: " + cmd);
+    sendError("Expected SPEAKING or IDLE, got: " + cmd);
   }
 
   returnToIdle();
@@ -321,33 +441,29 @@ void returnToIdle() {
   showStatus("Ready", "Press button\nor stand\nclose to\nstart");
   lastReportedDistance = -999;
   sendStatus("IDLE");
-
-  // Turn on Wi-Fi to draw extra current and prevent power bank auto-shutdown
-  WiFi.mode(WIFI_STA);
 }
 
 // ============================================================================
-// SERIAL LINE HELPERS
+// WEBSOCKET LINE HELPERS
 // ============================================================================
+void wsSendLine(const String &text) {
+  if (webSocket.isConnected()) {
+    webSocket.sendTXT(text);
+  }
+}
+
 void sendStatus(const String &text) {
-  Serial.print("STATUS:");
-  Serial.println(text);
+  wsSendLine("STATUS:" + text);
 }
 
 void sendError(const String &text) {
-  Serial.print("ERROR:");
-  Serial.println(text);
+  wsSendLine("ERROR:" + text);
 }
 
 // Blocks until a "COMMAND:<word>" line arrives (or timeout), returns <word>.
 // Returns "" on timeout. Any non-COMMAND line received while waiting is
 // ignored (defensive against stray STATUS echoes etc.).
 String waitForCommand(unsigned long timeoutMs) {
-  // Use readLineBlocking() in 100ms slices instead of Serial.readStringUntil().
-  // Serial.readStringUntil() has a hidden 1-second internal timeout (from
-  // Serial.setTimeout() default): if the '\n' doesn't arrive within that
-  // window it returns a truncated line that fails the "COMMAND:" check and
-  // is silently discarded, desyncing the ESP32 from the Python backend.
   unsigned long start = millis();
   while (true) {
     unsigned long elapsed = millis() - start;
@@ -423,13 +539,14 @@ void setupTFT() {
 }
 
 void showStatus(const char *title, const char *body, uint16_t titleColor) {
-  if (!tftReady || tftBusy) return;  // skip during audio - I2S DMA and SPI must not overlap
+  if (!tftReady) return;
 
   if (titleColor == 0) {
     if (strcmp(title, "Ready") == 0) titleColor = ST7735_GREEN;
     else if (strcmp(title, "Hello!") == 0) titleColor = ST7735_CYAN;
     else if (strcmp(title, "Listening...") == 0) titleColor = ST7735_GREEN;
     else if (strcmp(title, "Thinking...") == 0) titleColor = ST7735_YELLOW;
+    else if (strcmp(title, "Speaking...") == 0) titleColor = ST7735_CYAN;
     else if (strcmp(title, "Answering...") == 0) titleColor = ST7735_CYAN;
     else titleColor = ST7735_WHITE;
   }
@@ -502,7 +619,7 @@ void showStatus(const char *title, const char *body, uint16_t titleColor) {
 }
 
 void showIdleDistance(long dist) {
-  if (!tftReady || tftBusy) return;  // skip during audio - I2S DMA and SPI must not overlap
+  if (!tftReady) return;
   // Clear only the bottom sensor status area (y=107 to 127) to avoid screen flicker
   // and preserve all 4 lines of textSize=2 body text above (ends at y=102).
   tft.fillRect(0, 107, 160, 21, ST7735_BLACK);
@@ -528,7 +645,7 @@ void showIdleDistance(long dist) {
 // ============================================================================
 // MICROPHONE - laptop mic (no local I2S mic hardware)
 // ============================================================================
-// Audio capture has moved entirely to the laptop. When the backend sends
+// Audio capture is entirely on the laptop. When the backend sends
 // COMMAND:LISTEN, the ESP32 signals readiness with STATUS:LISTEN_READY, then
 // blocks waiting for STATUS:RECORDING_DONE from the laptop (sent once the
 // laptop has finished recording from its own microphone and is about to run
@@ -540,11 +657,8 @@ void streamMicToBackend() {
   // Wait until the laptop confirms it has finished recording.
   // The backend sends back "STATUS:RECORDING_DONE" as a plain line
   // (not a COMMAND: prefix) to distinguish it from the normal command flow.
-  // readLineBlocking() already polls Serial.available() internally with 2ms
-  // granularity — no outer Serial.available() wrapper is needed, and the
-  // old nested timeout clocks were not coordinated with each other.
   unsigned long start = millis();
-  while (millis() - start < SERIAL_CMD_TIMEOUT_MS) {
+  while (millis() - start < WS_CMD_TIMEOUT_MS) {
     String line = readLineBlocking(200);
     if (line == "STATUS:RECORDING_DONE") return;
     // Ignore stray lines (STATUS echoes, etc.) and keep waiting.
@@ -553,9 +667,9 @@ void streamMicToBackend() {
 }
 
 // ============================================================================
-// SPEAKER (MAX98357A) - I2S output
-// Note: this is now the ONLY I2S peripheral in use (I2S_SPK_PORT = I2S_NUM_0).
-//       The mic I2S peripheral (#1) has been removed along with the INMP441.
+// SPEAKER (MAX98357A, optional) - I2S output for the LOCAL greeting chirp
+// only. Nothing is ever received from the laptop and played here anymore -
+// see the WIRE PROTOCOL note above.
 // ============================================================================
 void setupSpeakerI2S() {
   i2s_config_t spkConfig = {
@@ -566,7 +680,7 @@ void setupSpeakerI2S() {
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     // I2S_DMA_BUF_LEN is in stereo samples (CHUNK_SAMPLES*2).
-    // 8 buffers at that size gives ~128ms of audio pipeline depth,
+    // 4 buffers at that size gives ~128ms of audio pipeline depth,
     // eliminating DMA underruns that cause crackling.
     .dma_buf_count = I2S_DMA_BUF_COUNT,
     .dma_buf_len = I2S_DMA_BUF_LEN,
@@ -587,9 +701,6 @@ void setupSpeakerI2S() {
 }
 
 // Software volume scale: 0.0 (silent) to 1.0 (full).
-// Reducing below 1.0 cuts peak current draw from the MAX98357A, which
-// reduces power rail droops that cause TFT SPI corruption (glitching).
-// Increase back to 1.0 once decoupling capacitors are installed.
 #define AUDIO_VOLUME_SCALE  0.70f
 
 // Writes one chunk of mono 16-bit PCM samples out to the speaker,
@@ -615,8 +726,8 @@ void playMonoPCM(const int16_t *mono, size_t sampleCount) {
 }
 
 // Writes one buffer of silence then delays long enough for all DMA buffers
-// to drain at the hardware level.  Call after every audio sequence (TTS reply
-// and greeting tone) so the I2S GDMA is fully idle before returnToIdle()
+// to drain at the hardware level.  Call after every local audio sequence
+// (the greeting chirp) so the I2S GDMA is fully idle before returnToIdle()
 // writes to the TFT - otherwise the SPI GDMA and I2S GDMA clash, producing
 // the simultaneous crackle + display glitch observed during testing.
 void drainAudioPipeline() {
@@ -649,96 +760,22 @@ void playGreetingTone() {
   }
 }
 
-// Reads one AUDIO_START:<len>:<crc32> / bytes / AUDIO_END frame from the
-// laptop and plays it as it arrives (chunked, no giant single malloc).
-bool receiveAndPlayAudio() {
-  String header = readLineBlocking(SERIAL_CMD_TIMEOUT_MS);
-  if (!header.startsWith("AUDIO_START:")) {
-    sendError("Expected AUDIO_START, got: " + header);
-    return false;
-  }
-
-  int firstColon = header.indexOf(':', 12);
-  if (firstColon < 0) {
-    sendError("Malformed AUDIO_START header");
-    return false;
-  }
-  uint32_t length = (uint32_t)header.substring(12, firstColon).toInt();
-  uint32_t expectedCrc = (uint32_t)strtoul(header.substring(firstColon + 1).c_str(), nullptr, 10);
-
-  static uint8_t buf[CHUNK_SAMPLES * sizeof(int16_t)];
-  uint32_t remaining = length;
-  uint32_t runningCrc = crc32Init();
-
-  while (remaining > 0) {
-    uint32_t toRead = remaining < sizeof(buf) ? remaining : sizeof(buf);
-    // Keep reads on 16-bit sample boundaries so playMonoPCM never sees a
-    // half-sample; audio length is always even in this protocol anyway.
-    toRead -= (toRead % sizeof(int16_t));
-    if (toRead == 0) toRead = remaining; // final odd byte (shouldn't happen)
-
-    if (!readExactBlocking(buf, toRead, SERIAL_CMD_TIMEOUT_MS)) {
-      sendError("Timed out reading audio payload");
-      return false;
-    }
-    runningCrc = crc32Update(runningCrc, buf, toRead);
-    // Played as it arrives (can't buffer an unbounded reply in ~320KB of
-    // SRAM); a CRC mismatch is only detectable *after* playback, so on
-    // mismatch we just report it - useful for catching a desynced stream
-    // during bring-up, but it can't undo audio already sent to the amp.
-    playMonoPCM((const int16_t *)buf, toRead / sizeof(int16_t));
-    remaining -= toRead;
-  }
-
-  // One blank-line separator (see streamMicToBackend()'s matching note),
-  // then the actual "AUDIO_END" line.
-  readLineBlocking(2000);
-  String endLine = readLineBlocking(2000);
-  if (endLine != "AUDIO_END") {
-    sendError("Expected AUDIO_END, got: " + endLine);
-    return false;
-  }
-
-  uint32_t actualCrc = crc32Final(runningCrc);
-  if (actualCrc != expectedCrc) {
-    sendError("TTS audio CRC mismatch - stream may be corrupted/desynced");
-    return false;
-  }
-  return true;
-}
-
-// Blocks until a full line (up to '\n') is available, or timeout. Trimmed,
-// so a trailing '\r' from a '\r\n'-terminated sender (e.g. Python's
-// pyserial writing "...\r\n", or Serial.println()'s own "\r\n") never
-// leaks into line-equality checks like `endLine != "AUDIO_END"`.
+// Blocks until a full line is available from the incoming WebSocket TEXT
+// frame queue, or timeout. Pumps webSocket.loop() on every poll so this
+// works correctly even when called from deep inside a long blocking wait
+// (waitForCommand, streamMicToBackend) that doesn't return to the top-level
+// loop() until a whole interaction ends - WebSocketsClient needs .loop()
+// called frequently to turn incoming TCP data into queued TEXT frames.
 String readLineBlocking(unsigned long timeoutMs) {
   unsigned long start = millis();
   while (millis() - start < timeoutMs) {
-    if (Serial.available()) {
-      String line = Serial.readStringUntil('\n');
+    webSocket.loop();
+    String line;
+    if (wsQueuePop(line)) {
       line.trim();
       return line;
     }
     delay(2);
   }
   return "";
-}
-
-// Blocks until exactly `length` bytes are read into buffer, or timeout.
-bool readExactBlocking(uint8_t *buffer, size_t length, unsigned long timeoutMs) {
-  size_t received = 0;
-  unsigned long start = millis();
-  while (received < length) {
-    if (millis() - start > timeoutMs) return false;
-    int avail = Serial.available();
-    if (avail <= 0) {
-      delay(1);
-      continue;
-    }
-    size_t toRead = (size_t)avail < (length - received) ? (size_t)avail : (length - received);
-    int n = Serial.readBytes(buffer + received, toRead);
-    if (n <= 0) continue;
-    received += n;
-  }
-  return true;
 }

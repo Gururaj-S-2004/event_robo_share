@@ -1,18 +1,35 @@
 # EventRobot backend
 
-Runs on the laptop, talks to the ESP32-S3 kiosk over USB serial (921600
-baud). Orchestrates: wait for TRIGGER -> COMMAND:GREET -> COMMAND:LISTEN
-(receive question audio) -> COMMAND:PROCESSING (offline STT -> local
-rulebook search -> Groq LLM -> offline TTS) -> COMMAND:SPEAK (send answer
-audio) -> COMMAND:IDLE.
+Runs on the laptop, talks to the ESP32-S3 kiosk over WiFi (this backend is
+the WebSocket *server*, the ESP32 is the WebSocket *client*). Orchestrates:
+wait for TRIGGER -> COMMAND:GREET -> COMMAND:LISTEN (record from the
+laptop's own mic) -> COMMAND:PROCESSING (offline STT -> local rulebook
+match/miss -> grounded or general Groq LLM answer -> offline TTS) ->
+COMMAND:SPEAKING (plays the answer on the laptop's own speakers) ->
+COMMAND:IDLE. USB is power only - no protocol data crosses it.
 
-The exact line/byte framing is documented in two places that must always
+The exact frame framing is documented in two places that must always
 agree: the `WIRE PROTOCOL` comment block at the top of `../EventRobot.ino`,
-and the module docstring in `serial_link.py`.
+and the module docstring in `ws_link.py`.
 
 Everything is offline/free except the LLM call (`llm.py`, via Groq's API) -
-STT is `faster-whisper`, TTS is `Piper`, and rulebook lookup is local
-keyword search over `data/rulebook.json`.
+STT is `faster-whisper`, TTS is `Piper`, playback and mic capture are
+`sounddevice`, and rulebook lookup is local keyword search over
+`data/rulebook.json`.
+
+## Two answer paths
+
+`rulebook.py`'s `Rulebook.match()` returns an explicit `None` on a miss
+(never a silently-weak match). `main.py` branches on that:
+- **Match** -> `llm.answer_question()` - grounded, phrases an answer
+  strictly from the matched facts.
+- **Miss** -> `llm.answer_general()` - no event facts attached; warm and
+  conversational, free to answer general-knowledge questions, but
+  instructed to never invent facts about *this* event and to point the
+  visitor to a staff member instead.
+
+`main.py` logs which path was taken per interaction (`Answer path:
+GROUNDED` / `Answer path: GENERAL`) so you can spot rulebook coverage gaps.
 
 ## Setup
 
@@ -33,11 +50,17 @@ copy .env.example .env
 ```
 
 Then edit `.env`:
-- `SERIAL_PORT` - the COM port the ESP32 enumerates as (Device Manager).
+- `LAPTOP_WS_HOST` / `LAPTOP_WS_PORT` - the WebSocket server this backend
+  runs (default `0.0.0.0:8765`, listening on every local interface). The
+  ESP32 firmware's `WS_HOST` #define needs this laptop's actual LAN IP
+  (`ipconfig`), not `0.0.0.0`; `WS_PORT` must match `LAPTOP_WS_PORT`.
 - `GROQ_API_KEY` - paste your Groq API key here. **Only in `.env`, never in
   a file you'd commit** - `.env` should be gitignored.
 - `PIPER_MODEL_PATH` - path to a downloaded Piper voice `.onnx` file (see
   below).
+
+WiFi credentials (`WIFI_SSID` / `WIFI_PASSWORD`) live on the **firmware**
+side, in `../EventRobot.ino` - this backend has none of its own.
 
 ## Downloading a Piper voice
 
@@ -70,13 +93,19 @@ Edit `data/rulebook.json`. Every `TODO` field needs replacing:
 
 `rulebook.py` does simple keyword-overlap search - keep `keywords` lists
 generous (include synonyms, informal phrasing) since there's no fuzzy
-matching or embeddings involved.
+matching or embeddings involved. Anything that doesn't score above
+threshold falls through to `llm.answer_general()` instead of a grounded
+answer - see "Two answer paths" above.
 
 ## Running
 
 ```
 python main.py
 ```
+
+Make sure the laptop's firewall allows inbound connections on
+`LAPTOP_WS_PORT` (Windows will usually prompt the first time - allow it on
+Private networks), and that the ESP32 is on the same WiFi network.
 
 ## Testing without hardware
 
@@ -86,33 +115,30 @@ pytest tests/ -v
 ```
 
 `tests/test_offline_cycle.py` runs a full trigger -> greet -> listen ->
-processing -> speak -> idle cycle against an in-memory fake serial pair
-(`tests/fake_stream.py`), with STT/TTS/LLM monkeypatched out. It exists to
-catch wire-protocol desyncs between `main.py`/`serial_link.py` and
-`EventRobot.ino` without needing a board plugged in.
+processing -> speak(local) -> idle cycle against an in-memory fake
+WebSocket transport (`tests/fake_stream.py`), with STT/TTS/LLM
+monkeypatched out, plus a dedicated test asserting a rulebook miss calls
+`llm.answer_general()` and never the grounded path. It exists to catch
+wire-protocol desyncs between `main.py`/`ws_link.py` and `EventRobot.ino`
+without needing a board or a real network socket.
 
 ## Fragile points / things to double-check before a live demo
 
-- **Serial port auto-reset**: opening a COM port to an ESP32 toggles DTR
-  and reboots the board (Arduino-core default). `main.py` only reopens the
-  port on an actual `OSError` (cable unplugged), not on ordinary protocol
-  errors - don't "fix" a stuck interaction by restarting `main.py`
-  repeatedly if the board is otherwise fine, since each restart reboots it.
-- **Fixed 5-second listening window**: `EventRobot.ino`'s `RECORD_SECONDS`
-  is a fixed capture window, not silence-detected. A visitor who talks
-  past 5 seconds gets truncated. If that's a problem live, raise
-  `RECORD_SECONDS` in the .ino (and reflash) rather than trying to fix it
-  from the backend.
-- **CRC mismatches are logged, not retried**: both directions verify a
-  CRC32 but there's no automatic re-send - a bad frame just aborts that one
-  interaction (the visitor sees a "no response" style failure and gets
-  cycled back to idle). Fine for a kiosk with light foot traffic; not
-  designed for a lossy/long serial cable.
-- **Mic gain shift (`>>14`) in EventRobot.ino**: tuned by feel, not
-  measured. If STT accuracy is poor, check `stt.py`'s log line for the
-  transcript first - if it's consistently garbled/clipped, that shift
-  amount is the first thing to revisit, not the Whisper model size.
+- **WiFi/WebSocket reconnects use exponential backoff (1s -> 30s cap)** -
+  on a drop, the ESP32 retries automatically and shows "Reconnecting..."
+  on the TFT; `main.py` waits for the reconnect (`WSServer.accept()`) and
+  resends `COMMAND:IDLE` to resync state once it's back. Don't restart
+  `main.py` to "fix" a stuck interaction if the board itself is fine - it
+  will just wait for the same reconnect the board is already doing.
+- **Fixed ~5-second listening window**: `MIC_RECORD_SECONDS` in `.env` is a
+  fixed capture window, not silence-detected. A visitor who talks past it
+  gets truncated - raise it in `.env` if that's a problem live (no
+  reflash needed, since the mic is the laptop's own).
 - **Groq model name**: `GROQ_MODEL` in `.env.example` is a best-guess
   default (`llama-3.1-8b-instant`) - Groq's available model list changes;
   confirm the model is still served before the event, since an invalid
   model name will surface at request time as `LLMError`, not at startup.
+- **`answer_general()` still costs a Groq call**: a rulebook miss isn't
+  free, it's the same LLM request minus the event facts. Watch the logged
+  GROUNDED/GENERAL path per interaction to gauge rulebook coverage and API
+  usage.

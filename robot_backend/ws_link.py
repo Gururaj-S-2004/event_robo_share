@@ -1,120 +1,119 @@
-"""Serial transport for talking to the ESP32-S3 EventRobot.
+"""WebSocket transport for talking to the ESP32-S3 EventRobot over WiFi.
 
 This module is the Python half of the wire protocol documented in the
 WIRE PROTOCOL comment block at the top of ../EventRobot.ino. The two files
 must always agree exactly - if you change one, change the other and re-run
 tests/test_offline_cycle.py.
 
-Protocol recap (ASCII lines, '\\n'-terminated; ESP32 sends '\\r\\n' via
-println() but both sides strip trailing '\\r\\n'):
+The laptop is the WebSocket *server* (this module); the ESP32 is the
+WebSocket *client* that dials out to it. Only one kiosk connects at a time.
+
+Protocol recap (each ASCII "line" below is one WebSocket TEXT frame - no
+'\\n' needed, WebSocket messages are already framed):
 
   ESP32 -> laptop:
     STATUS:<text>
     TRIGGER:BUTTON | TRIGGER:PROXIMITY
     ERROR:<text>
-    AUDIO_START:<len>:<crc32>  (+ <len> raw PCM16LE mono 16kHz bytes,
-                                 + one blank-line separator, + "AUDIO_END")
 
   laptop -> ESP32:
     COMMAND:GREET | COMMAND:LISTEN | COMMAND:PROCESSING |
-    COMMAND:SPEAK (+ one AUDIO_START/.../AUDIO_END frame) | COMMAND:IDLE
+    COMMAND:DISPLAY_A:<text> | COMMAND:SPEAKING | COMMAND:IDLE
+
+  laptop -> ESP32 (bare line, not COMMAND:-prefixed):
+    STATUS:RECORDING_DONE
+
+Mic capture and TTS playback both happen entirely on the laptop (mic.py,
+tts.py) - no audio ever crosses this link in either direction today.
+AUDIO_START:<len>:<crc32> / <len> raw PCM16LE mono 16kHz bytes (as one
+BINARY frame) / AUDIO_END is kept below as a documented transport
+primitive (read_audio_frame()/send_audio_frame()) for potential future
+reuse, but nothing in this codebase calls it.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
-import time
 import zlib
-from typing import Optional, Protocol
+from typing import Any, Optional
 
-logger = logging.getLogger("robot_backend.serial_link")
+import websockets
+
+logger = logging.getLogger("robot_backend.ws_link")
 
 AUDIO_START_RE = re.compile(r"^AUDIO_START:(\d+):(\d+)$")
 
-# Must match EventRobot.ino's SERIAL_BAUD.
-DEFAULT_BAUD = 921600
+# Must match robot_backend/.env's LAPTOP_WS_HOST / LAPTOP_WS_PORT and the
+# WS_HOST / WS_PORT #defines at the top of EventRobot.ino.
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 8765
 
 
-class SerialLinkError(Exception):
-    """Any protocol-level failure: malformed frame, CRC mismatch, etc."""
+class WSLinkError(Exception):
+    """Any protocol-level failure: malformed frame, CRC mismatch, unexpected
+    frame type, etc."""
 
 
-class SerialTimeout(SerialLinkError):
-    """No data arrived before the deadline."""
+class WSLinkTimeout(WSLinkError):
+    """No message arrived before the deadline."""
 
 
-class ByteStream(Protocol):
-    """The subset of pyserial's Serial interface SerialLink depends on -
-    lets tests substitute an in-memory fake instead of a real COM port."""
-
-    timeout: Optional[float]
-
-    def read(self, size: int = 1) -> bytes: ...
-    def write(self, data: bytes) -> int: ...
-    def flush(self) -> None: ...
-    def close(self) -> None: ...
+class WSLinkClosed(WSLinkError):
+    """The underlying WebSocket connection closed (the ESP32 disconnected).
+    Callers should treat this as "wait for a reconnect", not a protocol bug."""
 
 
-class SerialLink:
-    def __init__(self, stream: ByteStream, default_timeout: float = 20.0):
-        self._stream = stream
+class WSLink:
+    """Wraps one live WebSocket connection to the ESP32 kiosk."""
+
+    def __init__(self, connection: Any, default_timeout: float = 20.0):
+        self._conn = connection
         self._default_timeout = default_timeout
 
-    @classmethod
-    def open(cls, port: str, baud: int = DEFAULT_BAUD, timeout: float = 20.0) -> "SerialLink":
-        import serial  # local import: keep pyserial optional for pure-logic tests
-
-        ser = serial.Serial(port, baud, timeout=timeout)
-        # Let the ESP32 finish its boot/auto-reset-on-open before we talk.
-        time.sleep(2.0)
-        ser.reset_input_buffer()
-        return cls(ser, default_timeout=timeout)
-
-    def close(self):
-        self._stream.close()
+    async def close(self) -> None:
+        await self._conn.close()
 
     # -- raw line I/O ---------------------------------------------------
 
-    def readline(self, timeout: Optional[float] = None) -> str:
-        """Reads one '\\n'-terminated line (CR/LF stripped). Raises
-        SerialTimeout if nothing arrives within `timeout` seconds."""
-        deadline_timeout = timeout if timeout is not None else self._default_timeout
-        buf = bytearray()
-        deadline = time.monotonic() + deadline_timeout
-        original_timeout = self._stream.timeout
-        self._stream.timeout = 0.2
+    async def readline(self, timeout: Optional[float] = None) -> str:
+        """Reads one TEXT-frame message (a "line" - no trailing newline,
+        WebSocket frames are already delimited). Raises WSLinkTimeout if
+        nothing arrives within `timeout` seconds, WSLinkClosed if the
+        connection drops while waiting."""
+        deadline = timeout if timeout is not None else self._default_timeout
         try:
-            while True:
-                if time.monotonic() > deadline:
-                    raise SerialTimeout("no line received before timeout")
-                chunk = self._stream.read(1)
-                if not chunk:
-                    continue
-                if chunk == b"\n":
-                    break
-                buf.extend(chunk)
-        finally:
-            self._stream.timeout = original_timeout
-        return buf.decode("utf-8", errors="replace").rstrip("\r")
+            message = await asyncio.wait_for(self._conn.recv(), timeout=deadline)
+        except asyncio.TimeoutError as e:
+            raise WSLinkTimeout("no message received before timeout") from e
+        except websockets.exceptions.ConnectionClosed as e:
+            raise WSLinkClosed(f"connection closed: {e}") from e
+        if isinstance(message, (bytes, bytearray)):
+            raise WSLinkError(
+                f"expected a text frame, got a {len(message)}-byte binary frame"
+            )
+        return message.rstrip("\r\n")
 
-    def send_line(self, text: str):
-        self._stream.write((text + "\n").encode("utf-8"))
-        self._stream.flush()
+    async def send_line(self, text: str) -> None:
+        try:
+            await self._conn.send(text)
+        except websockets.exceptions.ConnectionClosed as e:
+            raise WSLinkClosed(f"connection closed: {e}") from e
 
-    def send_command(self, name: str):
+    async def send_command(self, name: str) -> None:
         logger.debug("-> COMMAND:%s", name)
-        self.send_line(f"COMMAND:{name}")
+        await self.send_line(f"COMMAND:{name}")
 
     # -- high-level protocol helpers -------------------------------------
 
-    def wait_for_trigger(self, poll_timeout: float = 1.0) -> str:
+    async def wait_for_trigger(self, poll_timeout: float = 1.0) -> str:
         """Blocks (polling in poll_timeout-sized slices, forever) until a
         TRIGGER: line arrives. STATUS:/ERROR: lines seen while waiting are
         logged and ignored. Returns the trigger source, e.g. "BUTTON"."""
         while True:
             try:
-                line = self.readline(timeout=poll_timeout)
-            except SerialTimeout:
+                line = await self.readline(timeout=poll_timeout)
+            except WSLinkTimeout:
                 continue
             if not line:
                 continue
@@ -127,109 +126,112 @@ class SerialLink:
             else:
                 logger.debug("[ESP32] unrecognized line while idle: %r", line)
 
-    def wait_for_status(self, expected: str, timeout: Optional[float] = None) -> None:
+    async def wait_for_status(self, expected: str, timeout: Optional[float] = None) -> None:
         """Blocks for a specific "STATUS:<expected>" line, raising
-        SerialLinkError if an ERROR: line or a non-matching STATUS arrives
+        WSLinkError if an ERROR: line or a non-matching STATUS arrives
         first (mirrors the ESP32's own strict COMMAND: expectations)."""
-        line = self.readline(timeout=timeout)
+        line = await self.readline(timeout=timeout)
         if line == f"STATUS:{expected}":
             return
         if line.startswith("ERROR:"):
-            raise SerialLinkError(f"ESP32 reported error: {line[len('ERROR:'):]}")
-        raise SerialLinkError(f"expected STATUS:{expected}, got: {line!r}")
+            raise WSLinkError(f"ESP32 reported error: {line[len('ERROR:'):]}")
+        raise WSLinkError(f"expected STATUS:{expected}, got: {line!r}")
 
-    # -- audio framing ----------------------------------------------------
+    # -- audio framing (documented but unused - see module docstring) -----
 
-    def read_audio_frame(self, timeout: Optional[float] = None) -> bytes:
-        """Blocks for one AUDIO_START:<len>:<crc32> / bytes / AUDIO_END
-        frame and returns the raw PCM16LE mono bytes."""
-        header = self.readline(timeout=timeout)
+    async def read_audio_frame(self, timeout: Optional[float] = None) -> bytes:
+        """Blocks for one AUDIO_START:<len>:<crc32> TEXT frame, one BINARY
+        frame of exactly <len> bytes, and an AUDIO_END TEXT frame; returns
+        the raw PCM16LE mono bytes. Not currently called anywhere."""
+        header = await self.readline(timeout=timeout)
         m = AUDIO_START_RE.match(header)
         if not m:
-            raise SerialLinkError(f"expected AUDIO_START, got: {header!r}")
+            raise WSLinkError(f"expected AUDIO_START, got: {header!r}")
         length = int(m.group(1))
         expected_crc = int(m.group(2))
 
-        payload = self._read_exact(length, timeout=timeout or self._default_timeout)
+        deadline = timeout if timeout is not None else self._default_timeout
+        try:
+            payload = await asyncio.wait_for(self._conn.recv(), timeout=deadline)
+        except asyncio.TimeoutError as e:
+            raise WSLinkTimeout("timed out waiting for audio binary frame") from e
+        except websockets.exceptions.ConnectionClosed as e:
+            raise WSLinkClosed(f"connection closed: {e}") from e
+        if not isinstance(payload, (bytes, bytearray)):
+            raise WSLinkError("expected a binary frame for the audio payload, got text")
+        if len(payload) != length:
+            raise WSLinkError(
+                f"audio frame length mismatch: header said {length}, got {len(payload)}"
+            )
 
-        # One blank-line separator, then the AUDIO_END line - see the
-        # matching comment in EventRobot.ino's streamMicToBackend().
-        self.readline(timeout=2.0)
-        end_line = self.readline(timeout=2.0)
+        end_line = await self.readline(timeout=2.0)
         if end_line != "AUDIO_END":
-            raise SerialLinkError(f"expected AUDIO_END, got: {end_line!r}")
+            raise WSLinkError(f"expected AUDIO_END, got: {end_line!r}")
 
-        actual_crc = zlib.crc32(payload) & 0xFFFFFFFF
+        actual_crc = zlib.crc32(bytes(payload)) & 0xFFFFFFFF
         if actual_crc != expected_crc:
-            raise SerialLinkError(
+            raise WSLinkError(
                 f"audio CRC mismatch: expected {expected_crc}, got {actual_crc} "
                 f"({len(payload)} bytes) - stream may be desynced"
             )
-        return payload
+        return bytes(payload)
 
-    def send_audio_frame(self, pcm_bytes: bytes, baud: int = 921600):
-        """Sends one AUDIO_START:<len>:<crc32> / bytes / AUDIO_END frame.
-
-        Paces writes to stay within the ESP32's UART RX buffer capacity.
-        921600 baud = ~92160 bytes/sec on the wire.
-
-        IMPORTANT - Windows timer resolution:
-        time.sleep() on Windows defaults to 15.6ms granularity. Any sleep
-        shorter than ~16ms is effectively sleep(0), blasting bytes at OS
-        buffer speed (~800KB/s) instead of wire speed (~92KB/s), which
-        overflows the ESP32's UART RX buffer and causes:
-          - GetOverlappedResult errors in the Windows serial driver
-          - Dropped/corrupted bytes on the ESP32
-          - Crackling at the end of audio playback
-
-        Fix: use 4096-byte chunks so sleep_per_chunk ≈ 74ms, which is
-        safely above the 15.6ms Windows timer floor. At 60% of line speed
-        the ESP32 always has comfortable headroom to drain the UART while
-        simultaneously feeding the I2S speaker pipeline.
-        """
+    async def send_audio_frame(self, pcm_bytes: bytes) -> None:
+        """Sends one AUDIO_START:<len>:<crc32> TEXT frame, one BINARY frame
+        with `pcm_bytes`, then an AUDIO_END TEXT frame. Not currently
+        called anywhere - see module docstring."""
         crc = zlib.crc32(pcm_bytes) & 0xFFFFFFFF
-        self._stream.write(f"AUDIO_START:{len(pcm_bytes)}:{crc}\n".encode("utf-8"))
-        self._stream.flush()
-
-        bytes_per_sec = baud / 10  # 8N1 = 10 bits per byte
-        # 60% utilization → sleep_per_chunk for 4096-byte chunk ≈ 74ms.
-        # This is reliable on Windows where time.sleep has 15.6ms resolution.
-        target_bytes_per_sec = bytes_per_sec * 0.60
-        chunk_size = 4096
-        sleep_per_chunk = chunk_size / target_bytes_per_sec
-        # Hard floor: never sleep less than 30ms regardless of baud setting.
-        sleep_per_chunk = max(sleep_per_chunk, 0.030)
-
-        logger.debug(
-            "Sending %d bytes in %d-byte chunks, %.1fms inter-chunk sleep (%.0f%% line speed)",
-            len(pcm_bytes), chunk_size, sleep_per_chunk * 1000,
-            (chunk_size / sleep_per_chunk) / bytes_per_sec * 100,
-        )
-
-        for offset in range(0, len(pcm_bytes), chunk_size):
-            chunk = pcm_bytes[offset : offset + chunk_size]
-            self._stream.write(chunk)
-            self._stream.flush()
-            time.sleep(sleep_per_chunk)
-
-        self._stream.write(b"\n")  # blank-line separator, mirrors EventRobot.ino
-        self._stream.write(b"AUDIO_END\n")
-        self._stream.flush()
-
-    def _read_exact(self, length: int, timeout: float) -> bytes:
-        buf = bytearray()
-        deadline = time.monotonic() + timeout
-        original_timeout = self._stream.timeout
-        self._stream.timeout = 0.5
         try:
-            while len(buf) < length:
-                if time.monotonic() > deadline:
-                    raise SerialTimeout(
-                        f"timed out reading audio payload ({len(buf)}/{length} bytes)"
-                    )
-                chunk = self._stream.read(length - len(buf))
-                if chunk:
-                    buf.extend(chunk)
-        finally:
-            self._stream.timeout = original_timeout
-        return bytes(buf)
+            await self._conn.send(f"AUDIO_START:{len(pcm_bytes)}:{crc}")
+            await self._conn.send(pcm_bytes)
+            await self._conn.send("AUDIO_END")
+        except websockets.exceptions.ConnectionClosed as e:
+            raise WSLinkClosed(f"connection closed: {e}") from e
+
+
+class WSServer:
+    """Listens for the ESP32 kiosk to connect and hands back a ready-to-use
+    WSLink. Only one kiosk is expected at a time; if a new connection
+    arrives while a previous one is still open, the old one is closed."""
+
+    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
+                 command_timeout: float = 20.0):
+        self._host = host
+        self._port = port
+        self._command_timeout = command_timeout
+        self._pending: "asyncio.Queue[Any]" = asyncio.Queue()
+        self._active: Any = None
+        self._server = None
+
+    async def start(self) -> None:
+        self._server = await websockets.serve(
+            self._on_connect, self._host, self._port, ping_interval=20, ping_timeout=20
+        )
+        logger.info("WebSocket server listening on ws://%s:%d", self._host, self._port)
+
+    async def _on_connect(self, websocket, *_args) -> None:
+        # `*_args` absorbs the legacy `(websocket, path)` handler signature
+        # some websockets versions still use, alongside the newer
+        # single-argument `(websocket)` signature.
+        logger.info("ESP32 connected from %s", websocket.remote_address)
+        if self._active is not None and not self._active.closed:
+            logger.warning("New ESP32 connection while a previous one was still open - closing the old one")
+            await self._active.close()
+        self._active = websocket
+        await self._pending.put(websocket)
+        # Keep this handler task alive for the connection's lifetime -
+        # returning early would tear the socket down. WSLink methods use
+        # `websocket` directly; this coroutine just waits for it to close.
+        await websocket.wait_closed()
+        logger.info("ESP32 disconnected")
+
+    async def accept(self) -> WSLink:
+        """Blocks until an ESP32 connects (or reconnects), returning a
+        ready-to-use WSLink for that connection."""
+        websocket = await self._pending.get()
+        return WSLink(websocket, default_timeout=self._command_timeout)
+
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()

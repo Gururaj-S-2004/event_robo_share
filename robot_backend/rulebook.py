@@ -2,6 +2,12 @@
 
 Used to ground the LLM: we hand the top-matching rule(s) to llm.py as
 context rather than trusting the model to know event-specific facts.
+
+Callers deciding between the grounded path (llm.answer_question) and the
+friendly ungrounded fallback (llm.answer_general) should use match(), not
+search() directly - match() returns None as an explicit "nothing scored
+above threshold" signal instead of silently handing back an empty list
+that could be mistaken for "grounded, but with zero facts".
 """
 from __future__ import annotations
 
@@ -95,3 +101,11 @@ class Rulebook:
     def best_match(self, query: str) -> Optional[RuleMatch]:
         matches = self.search(query, top_k=1)
         return matches[0] if matches else None
+
+    def match(self, query: str, top_k: int = 3, min_score: int = 1) -> Optional[list[RuleMatch]]:
+        """Explicit rulebook-miss signal for main.py: returns the top
+        matching rules, or None if nothing scores above threshold. Callers
+        should branch on None (call llm.answer_general()) rather than
+        treating an empty list as "grounded with no facts"."""
+        matches = self.search(query, top_k=top_k, min_score=min_score)
+        return matches if matches else None
